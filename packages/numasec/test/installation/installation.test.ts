@@ -1,10 +1,16 @@
-import { describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { Effect, Layer, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { Installation } from "../../src/installation"
 
 const encoder = new TextEncoder()
+const previousRemoteUpgradeFlag = process.env["NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT"]
+
+afterEach(() => {
+  if (previousRemoteUpgradeFlag === undefined) delete process.env["NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT"]
+  else process.env["NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT"] = previousRemoteUpgradeFlag
+})
 
 function mockHttpClient(handler: (request: HttpClientRequest.HttpClientRequest) => Response) {
   const client = HttpClient.make((request) => Effect.succeed(HttpClientResponse.fromWeb(request, handler(request))))
@@ -147,6 +153,26 @@ describe("installation", () => {
         Installation.Service.use((svc) => svc.latest("brew")).pipe(Effect.provide(layer)),
       )
       expect(result).toBe("2.1.0")
+    })
+  })
+
+  describe("upgrade", () => {
+    test("默认拒绝远程 curl 升级脚本", async () => {
+      delete process.env["NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT"]
+      const layer = testLayer(() => new Response("#!/bin/bash\necho ok\n"))
+
+      await expect(
+        Effect.runPromise(Installation.Service.use((svc) => svc.upgrade("curl", "1.2.3")).pipe(Effect.provide(layer))),
+      ).rejects.toThrow("NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT=true")
+    })
+
+    test("显式开启后允许远程 curl 升级脚本", async () => {
+      process.env["NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT"] = "true"
+      const layer = testLayer(() => new Response("#!/bin/bash\necho ok\n"))
+
+      await expect(
+        Effect.runPromise(Installation.Service.use((svc) => svc.upgrade("curl", "1.2.3")).pipe(Effect.provide(layer))),
+      ).resolves.toBeUndefined()
     })
   })
 })

@@ -259,6 +259,12 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
         let result: { code: ChildProcessSpawner.ExitCode; stdout: string; stderr: string } | undefined
         switch (m) {
           case "curl":
+            if (!Flag.NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT) {
+              return yield* new UpgradeFailedError({
+                stderr:
+                  "Remote curl-based upgrades are disabled by default. Set NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT=true to re-enable them.",
+              })
+            }
             result = yield* upgradeCurl(target)
             break
           case "npm":

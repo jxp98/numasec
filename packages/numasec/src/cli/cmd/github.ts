@@ -34,6 +34,7 @@ import { Git } from "@/git"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Process } from "@/util"
 import { Effect } from "effect"
+import { requireGitHubAppApiBaseUrl, requireOidcBaseUrl } from "./github-guard"
 
 type GitHubAuthor = {
   login: string
@@ -323,6 +324,13 @@ export const GithubInstallCommand = cmd({
           }
 
           async function installGitHubApp() {
+            let githubAppApiBaseUrl: string
+            try {
+              githubAppApiBaseUrl = requireGitHubAppApiBaseUrl()
+            } catch (error) {
+              prompts.log.error(error instanceof Error ? error.message : String(error))
+              throw new UI.CancelledError()
+            }
             const s = prompts.spinner()
             s.start("Installing GitHub app")
 
@@ -368,7 +376,7 @@ export const GithubInstallCommand = cmd({
 
             async function getInstallation() {
               return await fetch(
-                `https://api.numasec.ai/get_github_app_installation?owner=${app.owner}&repo=${app.repo}`,
+                `${githubAppApiBaseUrl}/get_github_app_installation?owner=${app.owner}&repo=${app.repo}`,
               )
                 .then((res) => res.json())
                 .then((data) => data.installation)
@@ -461,7 +469,10 @@ export const GithubRunCommand = cmd({
       const variant = process.env["VARIANT"] || undefined
       const runId = normalizeRunId()
       const share = normalizeShare()
-      const oidcBaseUrl = normalizeOidcBaseUrl()
+      const useGithubToken = normalizeUseGithubToken()
+      const oidcBaseUrl = useGithubToken
+        ? undefined
+        : (process.env["OIDC_BASE_URL"]?.trim()?.replace(/\/+$/, "") || undefined)
       const { owner, repo } = context.repo
       // For repo events (schedule, workflow_dispatch), payload has no issue/comment data
       const payload = context.payload as
@@ -494,7 +505,6 @@ export const GithubRunCommand = cmd({
       const triggerCommentId = isCommentEvent
         ? (payload as IssueCommentEvent | PullRequestReviewCommentEvent).comment.id
         : undefined
-      const useGithubToken = normalizeUseGithubToken()
       const commentType = isCommentEvent
         ? context.eventName === "pull_request_review_comment"
           ? "pr_review"
@@ -741,12 +751,6 @@ export const GithubRunCommand = cmd({
         if (value === "true") return true
         if (value === "false") return false
         throw new Error(`Invalid use_github_token value: ${value}. Must be a boolean.`)
-      }
-
-      function normalizeOidcBaseUrl(): string {
-        const value = process.env["OIDC_BASE_URL"]
-        if (!value) return "https://api.numasec.ai"
-        return value.replace(/\/+$/, "")
       }
 
       function isIssueCommentEvent(
@@ -1037,15 +1041,16 @@ export const GithubRunCommand = cmd({
       }
 
       async function exchangeForAppToken(token: string) {
+        const baseUrl = oidcBaseUrl ?? requireOidcBaseUrl()
         const response = token.startsWith("github_pat_")
-          ? await fetch(`${oidcBaseUrl}/exchange_github_app_token_with_pat`, {
+          ? await fetch(`${baseUrl}/exchange_github_app_token_with_pat`, {
               method: "POST",
               headers: {
                 Authorization: `Bearer ${token}`,
               },
               body: JSON.stringify({ owner, repo }),
             })
-          : await fetch(`${oidcBaseUrl}/exchange_github_app_token`, {
+          : await fetch(`${baseUrl}/exchange_github_app_token`, {
               method: "POST",
               headers: {
                 Authorization: `Bearer ${token}`,

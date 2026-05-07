@@ -48,6 +48,7 @@ export namespace Flag {
   export const NUMASEC_SERVER_PASSWORD = process.env["NUMASEC_SERVER_PASSWORD"]
   export const NUMASEC_SERVER_USERNAME = process.env["NUMASEC_SERVER_USERNAME"]
   export const NUMASEC_ENABLE_QUESTION_TOOL = truthy("NUMASEC_ENABLE_QUESTION_TOOL")
+  export declare const NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT: boolean
 
   // Experimental
   export const NUMASEC_EXPERIMENTAL = truthy("NUMASEC_EXPERIMENTAL")
@@ -156,6 +157,14 @@ Object.defineProperty(Flag, "NUMASEC_PLUGIN_META_FILE", {
 Object.defineProperty(Flag, "NUMASEC_CLIENT", {
   get() {
     return process.env["NUMASEC_CLIENT"] ?? "cli"
+  },
+  enumerable: true,
+  configurable: false,
+})
+
+Object.defineProperty(Flag, "NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT", {
+  get() {
+    return truthy("NUMASEC_ENABLE_REMOTE_UPGRADE_SCRIPT")
   },
   enumerable: true,
   configurable: false,
