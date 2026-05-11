@@ -144,14 +144,14 @@ describe("redact-before-send", () => {
   })
 
   test("键路径分类避免误伤 hostname 等字段", () => {
-    expect(classifyKeyPath(["user", "firstName"]))toBe("name")
-    expect(classifyKeyPath(["contactPhone"]))toBe("phone")
-    expect(classifyKeyPath(["identityNumber"]))toBe("idCard")
-    expect(classifyKeyPath(["Authorization"]))toBe("authorization")
-    expect(classifyKeyPath(["hostname"]))toBeUndefined()
-    expect(classifyKeyPath(["filename"]))toBeUndefined()
-    expect(classifyKeyPath(["pathname"]))toBeUndefined()
-    expect(classifyKeyPath(["requestId"]))toBeUndefined()
+    expect(classifyKeyPath(["user", "firstName"])).toBe("name")
+    expect(classifyKeyPath(["contactPhone"])).toBe("phone")
+    expect(classifyKeyPath(["identityNumber"])).toBe("idCard")
+    expect(classifyKeyPath(["Authorization"])).toBe("authorization")
+    expect(classifyKeyPath(["hostname"])).toBeUndefined()
+    expect(classifyKeyPath(["filename"])).toBeUndefined()
+    expect(classifyKeyPath(["pathname"])).toBeUndefined()
+    expect(classifyKeyPath(["requestId"])).toBeUndefined()
   })
 
   test("JWT 摘要保留结构信息", () => {
