@@ -202,7 +202,7 @@ const SECRET_KEY_SET = new Set(SECRET_KEYS)
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b/g
 const BEARER_RE = /\bBearer\s+([A-Za-z0-9._~+/=-]{8,})/gi
 const AUTH_LINE_RE = /\b(Authorization|Proxy-Authorization)\s*:\s*([^\r\n]+)/gi
-const COOKIE_LINE_RE = /\bCookie\s*:\s*([^\r\n]+)/gi
+const COOKIE_LINE_RE = /(?<!-)Cookie\s*:\s*([^\r\n]+)/gi
 const SET_COOKIE_LINE_RE = /\bSet-Cookie\s*:\s*([^\r\n]+)/gi
 const CN_MOBILE_RE = /(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)/g
 const CN_ID_RE = /(?<![0-9Xx])(?:[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx])(?![0-9Xx])/g
