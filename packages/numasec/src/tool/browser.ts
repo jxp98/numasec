@@ -1,5 +1,5 @@
 import z from "zod"
-import { Effect } from "effect"
+import { Duration, Effect, Fiber, Schedule } from "effect"
 import path from "path"
 import * as Tool from "./tool"
 import DESCRIPTION from "./browser.txt"
@@ -10,15 +10,49 @@ import { Observation } from "@/core/observation"
 import { Operation } from "@/core/operation"
 import { activeIdentity, loadVault, resolveIdentityValue, saveVault } from "@/core/vault"
 import { Instance } from "@/project/instance"
+import { Log } from "../util"
 
 import { Question } from "@/question"
 
 const browserHeadfulDisableValues = new Set(["0", "false", "no", "off"])
+const browserConfiguredModes = new Set(["auto", "headless", "headful"])
+const log = Log.create({ service: "browser" })
+const DEFAULT_PAUSE_TIMEOUT_MS = 10 * 60 * 1000
+const MAX_PAUSE_TIMEOUT_MS = 60 * 60 * 1000
+const PAUSE_HEARTBEAT_MS = 15 * 1000
+
+export type BrowserConfiguredMode = "auto" | "headless" | "headful"
+export type BrowserEffectiveMode = Exclude<BrowserConfiguredMode, "auto">
 
 export function isBrowserHeadless(env: Record<string, string | undefined> = process.env) {
   const value = env.NUMASEC_BROWSER_HEADLESS?.trim().toLowerCase()
   if (!value) return true
   return !browserHeadfulDisableValues.has(value)
+}
+
+export function browserDefaultMode(env: Record<string, string | undefined> = process.env): BrowserConfiguredMode {
+  const value = env.NUMASEC_BROWSER_MODE?.trim().toLowerCase()
+  if (value && browserConfiguredModes.has(value)) return value as BrowserConfiguredMode
+  return isBrowserHeadless(env) ? "headless" : "headful"
+}
+
+export function resolveBrowserMode(input: {
+  action: Params["action"]
+  requestedMode?: BrowserConfiguredMode
+  existingMode?: BrowserEffectiveMode
+  env?: Record<string, string | undefined>
+}): BrowserEffectiveMode {
+  if (input.requestedMode === "headless" || input.requestedMode === "headful") return input.requestedMode
+  if (input.requestedMode === "auto") {
+    if (input.action === "pause") return "headful"
+    if (input.existingMode) return input.existingMode
+    return "headless"
+  }
+  if (input.existingMode) return input.existingMode
+  const configuredMode = browserDefaultMode(input.env)
+  if (configuredMode === "headless" || configuredMode === "headful") return configuredMode
+  if (input.action === "pause") return "headful"
+  return "headless"
 }
 
 export function browserLaunchOptions(input: {
@@ -27,9 +61,11 @@ export function browserLaunchOptions(input: {
   platform?: NodeJS.Platform
   isBun?: boolean
   uid?: number
+  mode?: BrowserEffectiveMode
 }) {
   const base = input.executablePath ? { executablePath: input.executablePath } : {}
-  const headless = isBrowserHeadless(input.env)
+  const launchMode = input.mode ?? (browserDefaultMode(input.env) === "headful" ? "headful" : "headless")
+  const headless = launchMode === "headless"
   const platform = input.platform ?? process.platform
   const isBun = input.isBun ?? typeof globalThis.Bun !== "undefined"
   const uid = input.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined)
@@ -62,8 +98,9 @@ export function browserLaunchOptions(input: {
 export async function bringBrowserPageToFront(
   page: { bringToFront?: () => Promise<unknown> } | null | undefined,
   env: Record<string, string | undefined> = process.env,
+  mode?: BrowserConfiguredMode | BrowserEffectiveMode,
 ) {
-  if (isBrowserHeadless(env)) return false
+  if (currentBrowserMode(env, mode) === "headless") return false
   if (!page || typeof page.bringToFront !== "function") return false
   await page.bringToFront().catch(() => undefined)
   return true
@@ -78,6 +115,7 @@ const parameters = z.object({
       "screenshot",
       "evaluate",
       "pause",
+      "close",
       "export_identity",
       "get_cookies",
       "dom_snapshot",
@@ -93,9 +131,18 @@ const parameters = z.object({
     .optional()
     .describe("URL to navigate to. When provided for non-navigate actions, the page is loaded first."),
   key: z.string().optional().describe("Identity key used by export_identity action"),
+  browser_mode: z.enum(["auto", "headless", "headful"]).optional().describe("Browser mode for this action (default follows NUMASEC_BROWSER_MODE or legacy headless env)"),
+  close_after_export: z.boolean().optional().describe("Close the browser session after export_identity succeeds"),
   selector: z.string().optional().describe("CSS selector for click/fill actions"),
   value: z.string().optional().describe("Value for fill action or JS code for evaluate"),
   timeout: z.number().optional().describe("Action timeout in ms (default 30000)"),
+  pause_timeout_ms: z
+    .number()
+    .int()
+    .min(0)
+    .max(MAX_PAUSE_TIMEOUT_MS)
+    .optional()
+    .describe("Manual pause timeout in milliseconds (default 600000, set 0 to wait indefinitely)"),
   headers: z
     .record(z.string(), z.string())
     .optional()
@@ -114,6 +161,7 @@ const parameters = z.object({
 })
 
 type Params = z.infer<typeof parameters>
+type BrowserAuthPhase = "anonymous" | "manual_login_wait" | "manual_login_complete" | "authenticated"
 
 interface ConsoleEntry {
   level: string
@@ -137,9 +185,32 @@ interface Session {
   console: ConsoleEntry[]
   network: NetworkEntry[]
   lastDom?: string
+  phase?: BrowserAuthPhase
+  mode: BrowserEffectiveMode
 }
 
 const sessions = new Map<string, Session>()
+
+function currentBrowserMode(env: Record<string, string | undefined> = process.env, mode?: BrowserConfiguredMode | BrowserEffectiveMode) {
+  return mode ?? browserDefaultMode(env)
+}
+
+function setBrowserAuthPhase(sessionID: string, session: Session, phase: BrowserAuthPhase, extra?: Record<string, unknown>) {
+  if (session.phase === phase) return
+  session.phase = phase
+  log.info("auth phase", { sessionID, phase, browser_mode: session.mode, ...extra })
+}
+
+export async function closeBrowserSession(sessionID: string) {
+  const existing = sessions.get(sessionID)
+  if (!existing) return false
+  sessions.delete(sessionID)
+  await existing.page.close().catch(() => undefined)
+  await existing.context.close().catch(() => undefined)
+  await existing.browser.close().catch(() => undefined)
+  log.info("session closed", { sessionID, browser_mode: existing.mode, phase: existing.phase })
+  return true
+}
 
 const EVIDENCE_MAX_OUTPUT = 128_000
 
@@ -411,7 +482,12 @@ function defaultBrowserIdentityKey(currentUrl?: string) {
 
 async function exportBrowserIdentityState(params: Params, sessionID: string) {
   const timeout = params.timeout ?? 30_000
-  const session = await ensure(sessionID)
+  const requestedMode = resolveBrowserMode({
+    action: params.action,
+    requestedMode: params.browser_mode,
+    existingMode: sessions.get(sessionID)?.mode,
+  })
+  const session = await ensure(sessionID, requestedMode)
   await hydrate(session.context, session.page, params)
   const page = session.page
   const context = session.context
@@ -463,10 +539,14 @@ async function exportBrowserIdentityState(params: Params, sessionID: string) {
   }
 }
 
-async function ensure(sessionID: string): Promise<Session> {
+async function ensure(sessionID: string, requestedMode?: BrowserEffectiveMode): Promise<Session> {
   const id = sessionID
   const existing = sessions.get(id)
-  if (existing) return existing
+  if (existing && (!requestedMode || existing.mode === requestedMode)) return existing
+  if (existing && requestedMode && existing.mode !== requestedMode) {
+    log.info("session mode switch", { sessionID: id, from: existing.mode, to: requestedMode })
+    await closeBrowserSession(id)
+  }
 
   let pw: typeof import("playwright") | undefined
   try {
@@ -486,20 +566,20 @@ async function ensure(sessionID: string): Promise<Session> {
   }
 
   if (!pw?.chromium?.launch) {
-    throw new Error("Playwright is not installed. Run: bun add playwright && npx playwright install chromium")
+    throw new Error("Playwright is not installed. Run: bun add playwright && bunx playwright install chromium")
   }
 
   let firstError: string | undefined
   let browser: Awaited<ReturnType<typeof pw.chromium.launch>>
   try {
-    browser = await pw.chromium.launch(browserLaunchOptions({}))
+    browser = await pw.chromium.launch(browserLaunchOptions({ mode: requestedMode }))
   } catch (err) {
     firstError = err instanceof Error ? err.message : String(err)
 
     const envPath = process.env.NUMASEC_CHROMIUM_PATH
     if (envPath) {
       try {
-        browser = await pw.chromium.launch(browserLaunchOptions({ executablePath: envPath }))
+        browser = await pw.chromium.launch(browserLaunchOptions({ executablePath: envPath, mode: requestedMode }))
       } catch {
         // Fallback to system PATH below
       }
@@ -511,7 +591,7 @@ async function ensure(sessionID: string): Promise<Session> {
         const found = Bun.which(name)
         if (!found) continue
         try {
-          browser = await pw.chromium.launch(browserLaunchOptions({ executablePath: found }))
+          browser = await pw.chromium.launch(browserLaunchOptions({ executablePath: found, mode: requestedMode }))
           break
         } catch {
           // try next
@@ -522,7 +602,7 @@ async function ensure(sessionID: string): Promise<Session> {
     if (!browser!) {
       const pathNote = envPath ? ` | tried NUMASEC_CHROMIUM_PATH=${envPath}` : ""
       throw new Error(
-        `Chromium browser not found. Run: npx playwright install chromium — ${firstError}${pathNote}`,
+        `Chromium browser not found. Run: bunx playwright install chromium — ${firstError}${pathNote}`,
       )
     }
   }
@@ -533,8 +613,9 @@ async function ensure(sessionID: string): Promise<Session> {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
   })
   const page = await context.newPage()
-  await bringBrowserPageToFront(page)
-  const entry: Session = { browser, context, page, console: [], network: [] }
+  const launchMode = requestedMode ?? (browserDefaultMode() === "headful" ? "headful" : "headless")
+  await bringBrowserPageToFront(page, undefined, launchMode)
+  const entry: Session = { browser, context, page, console: [], network: [], mode: launchMode }
 
   const MAX_BUFFER = 500
   page.on("console", (msg: any) => {
@@ -574,6 +655,7 @@ async function ensure(sessionID: string): Promise<Session> {
   })
 
   sessions.set(id, entry)
+  log.info("session created", { sessionID: id, browser_mode: entry.mode, headless: entry.mode === "headless" })
 
   return entry
 }
@@ -751,6 +833,9 @@ function browserEvidencePayload(params: Params, result: Tool.ExecuteResult) {
         url: params.url,
         selector: params.selector,
         timeout: params.timeout,
+        browser_mode: params.browser_mode,
+        pause_timeout_ms: params.pause_timeout_ms,
+        close_after_export: params.close_after_export,
         headers: params.headers,
         cookies: params.cookies,
       },
@@ -1052,12 +1137,23 @@ export function persistBrowserObservation(params: Params, result: Tool.ExecuteRe
 
 async function run(params: Params, sessionID: string): Promise<Tool.ExecuteResult> {
   const timeout = params.timeout ?? 30_000
-  const session = await ensure(sessionID)
+  const requestedMode = resolveBrowserMode({
+    action: params.action,
+    requestedMode: params.browser_mode,
+    existingMode: sessions.get(sessionID)?.mode,
+  })
+  const session = await ensure(sessionID, requestedMode)
   const identity = await hydrate(session.context, session.page, params)
   const page = session.page
   const context = session.context
 
-  await bringBrowserPageToFront(page)
+  if (identity?.key) {
+    setBrowserAuthPhase(sessionID, session, "authenticated", { active_identity: identity.key })
+  } else if (!session.phase) {
+    setBrowserAuthPhase(sessionID, session, "anonymous")
+  }
+
+  await bringBrowserPageToFront(page, undefined, session.mode)
 
   if (params.url && params.action !== "navigate" && params.action !== "passive_appsec") {
     await page.goto(params.url, { timeout, waitUntil: "domcontentloaded" })
@@ -1324,8 +1420,14 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
       parameters,
       execute: (params: Params, ctx: Tool.Context) =>
         Effect.gen(function* () {
-          if (params.action === "pause" && isBrowserHeadless()) {
-            throw new Error("browser pause requires a visible browser. Set NUMASEC_BROWSER_HEADLESS=false and retry.")
+          const requestedMode = resolveBrowserMode({
+            action: params.action,
+            requestedMode: params.browser_mode,
+            existingMode: sessions.get(ctx.sessionID)?.mode,
+          })
+
+          if (params.action === "pause" && requestedMode !== "headful") {
+            throw new Error("browser pause requires a visible browser. Set browser_mode=headful/auto or configure NUMASEC_BROWSER_MODE=auto.")
           }
 
           yield* ctx.ask({
@@ -1335,9 +1437,47 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
             metadata: { action: params.action, url: params.url },
           })
 
+          if (params.action === "close") {
+            const closed = yield* Effect.promise(() => closeBrowserSession(ctx.sessionID))
+            log.info("close action", { sessionID: ctx.sessionID, closed, browser_mode: currentBrowserMode(undefined, requestedMode) })
+
+            const result = {
+              title: closed ? "Browser session closed" : "Browser session not open",
+              metadata: {
+                action: "close",
+                closed,
+                browserMode: currentBrowserMode(undefined, requestedMode),
+              },
+              output: closed
+                ? "Closed the current browser session. Future browser actions will create a fresh session."
+                : "No open browser session was found for this numasec session.",
+            } satisfies Tool.ExecuteResult
+
+            yield* persistBrowserObservation(params, result, ctx).pipe(Effect.catch(() => Effect.void))
+            return result
+          }
+
           if (params.action === "export_identity") {
             const exported = yield* Effect.promise(() => exportBrowserIdentityState(params, ctx.sessionID))
             const stored = yield* persistExportedBrowserIdentity(exported, ctx)
+            const session = yield* Effect.promise(() => ensure(ctx.sessionID))
+            setBrowserAuthPhase(ctx.sessionID, session, "authenticated", {
+              active_identity: exported.key,
+              current_url: exported.currentUrl,
+            })
+
+            let closedAfterExport = false
+            if (params.close_after_export) {
+              closedAfterExport = yield* Effect.promise(() => closeBrowserSession(ctx.sessionID))
+            }
+
+            log.info("identity exported", {
+              sessionID: ctx.sessionID,
+              key: exported.key,
+              close_after_export: params.close_after_export === true,
+              closed_after_export: closedAfterExport,
+              browser_mode: currentBrowserMode(undefined, requestedMode),
+            })
 
             const result = {
               title: `identity · ${exported.key}`,
@@ -1352,6 +1492,9 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
                 sessionStorageKeys: exported.sessionKeys.length,
                 currentUrl: exported.currentUrl,
                 activeIdentity: exported.key,
+                authPhase: "authenticated",
+                browserMode: currentBrowserMode(undefined, requestedMode),
+                closedAfterExport,
               },
               output: [
                 `Active identity: ${exported.key}`,
@@ -1361,6 +1504,11 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
                 `Cookies: ${exported.cookieCount}`,
                 `localStorage keys inspected: ${exported.localKeys.length}`,
                 `sessionStorage keys inspected: ${exported.sessionKeys.length}`,
+                params.close_after_export
+                  ? closedAfterExport
+                    ? "Browser session closed after export."
+                    : "Requested browser close after export, but no open browser session was found."
+                  : "Browser session remains available for follow-up browser actions.",
                 "Subsequent http_request calls will automatically reuse this active identity unless you override headers or cookies explicitly.",
               ].join("\n"),
             } satisfies Tool.ExecuteResult
@@ -1373,29 +1521,133 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
 
           if (params.action === "pause") {
             const session = yield* Effect.promise(() => ensure(ctx.sessionID))
-            yield* Effect.promise(() => bringBrowserPageToFront(session.page))
+            yield* Effect.promise(() => bringBrowserPageToFront(session.page, undefined, session.mode))
 
-            yield* question.ask({
-              sessionID: ctx.sessionID,
-              tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
-              questions: [
-                {
-                  header: "Browser",
-                  question:
-                    "Complete the manual browser step in the visible browser (for example login, SSO, MFA, or a challenge), then choose Continue.",
-                  options: [
-                    {
-                      label: "Continue",
-                      description: "Resume automated testing with the current browser session",
-                    },
-                  ],
-                  custom: false,
-                },
-              ],
+            const pauseTimeoutMs = Math.max(0, Math.min(params.pause_timeout_ms ?? DEFAULT_PAUSE_TIMEOUT_MS, MAX_PAUSE_TIMEOUT_MS))
+            const startedAt = Date.now()
+            setBrowserAuthPhase(ctx.sessionID, session, "manual_login_wait", {
+              current_url: session.page.url() || params.url,
+              pause_timeout_ms: pauseTimeoutMs || undefined,
             })
+            log.info("manual wait started", {
+              sessionID: ctx.sessionID,
+              current_url: session.page.url() || params.url,
+              pause_timeout_ms: pauseTimeoutMs || undefined,
+              browser_mode: session.mode,
+            })
+
+            yield* ctx
+              .metadata({
+                title: "Browser paused for manual step",
+                metadata: {
+                  ...result.metadata,
+                  waitingForOperator: true,
+                  pauseTimeoutMs: pauseTimeoutMs || undefined,
+                  browserMode: session.mode,
+                },
+              })
+              .pipe(Effect.catch(() => Effect.void))
+
+            const heartbeatFiber = yield* Effect.gen(function* () {
+              const waitedMs = Date.now() - startedAt
+              const currentUrl = session.page.url()
+              log.info("manual wait heartbeat", {
+                sessionID: ctx.sessionID,
+                current_url: currentUrl || params.url,
+                waited_ms: waitedMs,
+                pause_timeout_ms: pauseTimeoutMs || undefined,
+                browser_mode: session.mode,
+              })
+              yield* ctx
+                .metadata({
+                  title: "Browser paused for manual step",
+                  metadata: {
+                    ...result.metadata,
+                    currentUrl,
+                    waitingForOperator: true,
+                    waitedMs,
+                    pauseTimeoutMs: pauseTimeoutMs || undefined,
+                    browserMode: session.mode,
+                  },
+                })
+                .pipe(Effect.catch(() => Effect.void))
+            }).pipe(
+              Effect.delay(Duration.millis(PAUSE_HEARTBEAT_MS)),
+              Effect.repeat(Schedule.spaced(Duration.millis(PAUSE_HEARTBEAT_MS))),
+              Effect.forkScoped,
+            )
+
+            const abort = Effect.callback<void>((resume) => {
+              if (ctx.abort.aborted) return resume(Effect.void)
+              const handler = () => resume(Effect.void)
+              ctx.abort.addEventListener("abort", handler, { once: true })
+              return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+            })
+
+            const outcome = yield* Effect.raceAll([
+              question.ask({
+                sessionID: ctx.sessionID,
+                tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+                questions: [
+                  {
+                    header: "Browser",
+                    question:
+                      "Complete the manual browser step in the visible browser (for example login, SSO, MFA, or a challenge), then choose Continue.",
+                    options: [
+                      {
+                        label: "Continue",
+                        description: "Resume automated testing with the current browser session",
+                      },
+                    ],
+                    custom: false,
+                  },
+                ],
+              }).pipe(Effect.map(() => ({ kind: "continue" as const }))),
+              abort.pipe(Effect.map(() => ({ kind: "abort" as const }))),
+              ...(pauseTimeoutMs > 0
+                ? [Effect.sleep(`${pauseTimeoutMs} millis`).pipe(Effect.map(() => ({ kind: "timeout" as const })))]
+                : []),
+            ]).pipe(Effect.ensuring(Fiber.interrupt(heartbeatFiber)))
+
+            if (outcome.kind === "abort") {
+              setBrowserAuthPhase(ctx.sessionID, session, result.metadata.activeIdentity ? "authenticated" : "anonymous", {
+                current_url: session.page.url() || params.url,
+              })
+              log.warn("manual wait aborted", {
+                sessionID: ctx.sessionID,
+                waited_ms: Date.now() - startedAt,
+                browser_mode: session.mode,
+              })
+              throw new DOMException("Aborted", "AbortError")
+            }
+
+            if (outcome.kind === "timeout") {
+              setBrowserAuthPhase(ctx.sessionID, session, result.metadata.activeIdentity ? "authenticated" : "anonymous", {
+                current_url: session.page.url() || params.url,
+              })
+              log.warn("manual wait timed out", {
+                sessionID: ctx.sessionID,
+                waited_ms: Date.now() - startedAt,
+                pause_timeout_ms: pauseTimeoutMs,
+                browser_mode: session.mode,
+              })
+              throw new Error(`Browser manual step timed out after ${pauseTimeoutMs}ms`)
+            }
 
             const currentUrl = session.page.url()
             const cookies = yield* Effect.promise(() => session.context.cookies())
+            setBrowserAuthPhase(ctx.sessionID, session, "manual_login_complete", {
+              current_url: currentUrl,
+              cookie_count: cookies.length,
+            })
+            log.info("manual wait resumed", {
+              sessionID: ctx.sessionID,
+              current_url: currentUrl,
+              cookie_count: cookies.length,
+              waited_ms: Date.now() - startedAt,
+              browser_mode: session.mode,
+            })
+
             const resumed = {
               ...result,
               title: "Browser resumed",
@@ -1404,6 +1656,10 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
                 currentUrl,
                 cookieCount: cookies.length,
                 resumed: true,
+                waitedMs: Date.now() - startedAt,
+                pauseTimeoutMs: pauseTimeoutMs || undefined,
+                authPhase: "manual_login_complete",
+                browserMode: session.mode,
               },
               output: [
                 result.output,
@@ -1411,6 +1667,7 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
                 "Resumed browser session.",
                 `Current URL: ${currentUrl || "(blank page)"}`,
                 `Cookies: ${cookies.length}`,
+                pauseTimeoutMs > 0 ? `Pause timeout: ${pauseTimeoutMs}ms` : "Pause timeout: disabled",
                 "You can now continue with storage_snapshot, get_cookies, dom_snapshot, or follow-up browser actions.",
               ].join("\n"),
             }

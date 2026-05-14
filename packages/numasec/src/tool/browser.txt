@@ -6,7 +6,8 @@ Actions:
 - fill: Fill a form field by CSS selector with a value
 - screenshot: Capture a full-page PNG screenshot
 - evaluate: Execute arbitrary JavaScript in the page context
-- pause: Pause and wait for the operator to finish a manual browser step（例如登录、SSO、MFA、验证码）后再继续
+- pause: Pause and wait for the operator to finish a manual browser step（例如登录、SSO、MFA、验证码）后再继续；支持超时与等待心跳日志
+- close: Close the current browser session so later browser actions start fresh
 - export_identity: Export the current browser login state into the active identity for follow-up http_request and API testing
 - get_cookies: Retrieve all cookies for the current browser context
 - dom_snapshot: Capture full DOM + structured summary (forms, links, scripts). Caches for dom_diff.
@@ -20,9 +21,12 @@ Parameters:
 - action: The browser action to perform
 - url: URL to navigate to (required for navigate and passive_appsec, optional for others to pre-navigate)
 - key: Identity key to store when using export_identity
+- browser_mode: Browser mode for this action (`auto`, `headless`, `headful`); when omitted, an existing browser session keeps its current mode
+- close_after_export: Close the browser session after export_identity succeeds
 - selector: CSS selector for click/fill actions
 - value: Text value for fill, or JavaScript code for evaluate
 - timeout: Action timeout in milliseconds (default 30000)
+- pause_timeout_ms: Timeout for manual pause waiting (default 600000, set 0 to wait indefinitely)
 - headers: Custom HTTP headers to inject into all browser requests
 - cookies: Raw Cookie header string to seed the browser session
 - local_storage: Key-value pairs to seed into localStorage
@@ -36,8 +40,9 @@ Use this tool for:
 - Filling and submitting forms programmatically
 - Testing authentication flows with cookie/token seeding
 - Performing half-manual workflows where the operator logs in and the browser session is resumed afterward
+- Exporting identity and then closing the visible browser to reduce long-lived GUI sessions
 - Exporting browser-acquired login state for follow-up API testing with http_request
 - Capturing screenshots as evidence of security findings
 - Evaluating JavaScript to inspect page state or trigger behaviors
 
-Requires Playwright and Chromium binaries. For visible browser windows, set `NUMASEC_BROWSER_HEADLESS=false`. For static pages, prefer http_request instead.
+Requires Playwright and Chromium binaries. Use `NUMASEC_BROWSER_MODE=auto` for mixed anonymous/headful-login workflows, `NUMASEC_BROWSER_HEADLESS=false` or `browser_mode=headful` for fully visible runs, and prefer http_request for static pages. Install Chromium with `bunx playwright install chromium` when needed.

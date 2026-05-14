@@ -15,8 +15,11 @@ import { MessageID, SessionID } from "../../src/session/schema"
 import { Truncate } from "../../src/tool"
 import {
   BrowserTool,
+  browserDefaultMode,
   browserLaunchOptions,
   bringBrowserPageToFront,
+  closeBrowserSession,
+  resolveBrowserMode,
   cookieHeaderFromContextCookies,
   inferIdentityHeadersFromStorage,
   isBrowserHeadless,
@@ -46,13 +49,31 @@ describe("tool/browser", () => {
   test("pause is a valid action in the public parameters schema", async () => {
     const info = await runtime.runPromise(BrowserTool)
     const tool: any = await runtime.runPromise(info.init())
-    expect(() => tool.parameters.parse({ action: "pause", url: "https://example.com/login" })).not.toThrow()
+    expect(() =>
+      tool.parameters.parse({
+        action: "pause",
+        url: "https://example.com/login",
+        pause_timeout_ms: 60_000,
+      }),
+    ).not.toThrow()
+  })
+
+  test("close is a valid action in the public parameters schema", async () => {
+    const info = await runtime.runPromise(BrowserTool)
+    const tool: any = await runtime.runPromise(info.init())
+    expect(() => tool.parameters.parse({ action: "close" })).not.toThrow()
   })
 
   test("export_identity is a valid action in the public parameters schema", async () => {
     const info = await runtime.runPromise(BrowserTool)
     const tool: any = await runtime.runPromise(info.init())
-    expect(() => tool.parameters.parse({ action: "export_identity", key: "browser:example.com" })).not.toThrow()
+    expect(() =>
+      tool.parameters.parse({
+        action: "export_identity",
+        key: "browser:example.com",
+        close_after_export: true,
+      }),
+    ).not.toThrow()
   })
 
   test("NUMASEC_BROWSER_HEADLESS=false switches browser to headful mode", () => {
@@ -61,6 +82,40 @@ describe("tool/browser", () => {
     expect(isBrowserHeadless({ NUMASEC_BROWSER_HEADLESS: "0" })).toBe(false)
     expect(isBrowserHeadless({ NUMASEC_BROWSER_HEADLESS: "off" })).toBe(false)
     expect(isBrowserHeadless({ NUMASEC_BROWSER_HEADLESS: "true" })).toBe(true)
+  })
+
+  test("NUMASEC_BROWSER_MODE=auto uses headless by default and headful for pause", () => {
+    expect(browserDefaultMode({ NUMASEC_BROWSER_MODE: "auto" })).toBe("auto")
+    expect(resolveBrowserMode({ action: "navigate", requestedMode: "auto" })).toBe("headless")
+    expect(resolveBrowserMode({ action: "pause", requestedMode: "auto" })).toBe("headful")
+    expect(resolveBrowserMode({ action: "click", requestedMode: "auto", existingMode: "headful" })).toBe("headful")
+  })
+
+  test("未显式指定 browser_mode 时会复用现有会话模式", () => {
+    expect(
+      resolveBrowserMode({
+        action: "storage_snapshot",
+        existingMode: "headful",
+        env: { NUMASEC_BROWSER_HEADLESS: "true" },
+      }),
+    ).toBe("headful")
+    expect(
+      resolveBrowserMode({
+        action: "storage_snapshot",
+        requestedMode: "headless",
+        existingMode: "headful",
+        env: { NUMASEC_BROWSER_MODE: "auto" },
+      }),
+    ).toBe("headless")
+  })
+
+  test("显式 headful 模式会覆盖默认无头环境", () => {
+    expect(
+      browserLaunchOptions({
+        env: { NUMASEC_BROWSER_MODE: "auto", NUMASEC_BROWSER_HEADLESS: "true" },
+        mode: "headful",
+      }),
+    ).toEqual({ headless: false })
   })
 
   test("Linux root 有头模式会自动附加 Chromium 兼容参数", () => {
@@ -104,6 +159,10 @@ describe("tool/browser", () => {
 
     expect(focused).toBe(false)
     expect(calls).toBe(0)
+  })
+
+  test("closeBrowserSession 在没有会话时返回 false", async () => {
+    await expect(closeBrowserSession("ses_missing")).resolves.toBe(false)
   })
 
   test("按存储语义提取 Authorization、CSRF 与 API Key", () => {
