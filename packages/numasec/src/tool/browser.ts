@@ -21,6 +21,44 @@ export function isBrowserHeadless(env: Record<string, string | undefined> = proc
   return !browserHeadfulDisableValues.has(value)
 }
 
+export function browserLaunchOptions(input: {
+  env?: Record<string, string | undefined>
+  executablePath?: string
+  platform?: NodeJS.Platform
+  isBun?: boolean
+  uid?: number
+}) {
+  const base = input.executablePath ? { executablePath: input.executablePath } : {}
+  const headless = isBrowserHeadless(input.env)
+  const platform = input.platform ?? process.platform
+  const isBun = input.isBun ?? typeof globalThis.Bun !== "undefined"
+  const uid = input.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined)
+
+  if (platform === "win32" && isBun) {
+    if (!headless) {
+      return {
+        ...base,
+        headless: false,
+      }
+    }
+    return {
+      ...base,
+      headless: false,
+      args: ["--headless=new"],
+    }
+  }
+
+  if (!headless && platform === "linux" && uid === 0) {
+    return {
+      ...base,
+      headless: false,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"],
+    }
+  }
+
+  return { ...base, headless }
+}
+
 const parameters = z.object({
   action: z
     .enum([
@@ -442,36 +480,17 @@ async function ensure(abort: AbortSignal): Promise<Session> {
     throw new Error("Playwright is not installed. Run: bun add playwright && npx playwright install chromium")
   }
 
-  const launchOptions = (executablePath?: string) => {
-    const base = executablePath ? { executablePath } : {}
-    const headless = isBrowserHeadless()
-    if (process.platform === "win32" && typeof globalThis.Bun !== "undefined") {
-      if (!headless) {
-        return {
-          ...base,
-          headless: false,
-        } as Parameters<typeof pw.chromium.launch>[0]
-      }
-      return {
-        ...base,
-        headless: false,
-        args: ["--headless=new"],
-      } as Parameters<typeof pw.chromium.launch>[0]
-    }
-    return { ...base, headless } as Parameters<typeof pw.chromium.launch>[0]
-  }
-
   let firstError: string | undefined
   let browser: Awaited<ReturnType<typeof pw.chromium.launch>>
   try {
-    browser = await pw.chromium.launch(launchOptions())
+    browser = await pw.chromium.launch(browserLaunchOptions({}))
   } catch (err) {
     firstError = err instanceof Error ? err.message : String(err)
 
     const envPath = process.env.NUMASEC_CHROMIUM_PATH
     if (envPath) {
       try {
-        browser = await pw.chromium.launch(launchOptions(envPath))
+        browser = await pw.chromium.launch(browserLaunchOptions({ executablePath: envPath }))
       } catch {
         // Fallback to system PATH below
       }
@@ -483,7 +502,7 @@ async function ensure(abort: AbortSignal): Promise<Session> {
         const found = Bun.which(name)
         if (!found) continue
         try {
-          browser = await pw.chromium.launch(launchOptions(found))
+          browser = await pw.chromium.launch(browserLaunchOptions({ executablePath: found }))
           break
         } catch {
           // try next

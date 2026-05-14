@@ -15,6 +15,7 @@ import { MessageID, SessionID } from "../../src/session/schema"
 import { Truncate } from "../../src/tool"
 import {
   BrowserTool,
+  browserLaunchOptions,
   cookieHeaderFromContextCookies,
   inferIdentityHeadersFromStorage,
   isBrowserHeadless,
@@ -59,6 +60,19 @@ describe("tool/browser", () => {
     expect(isBrowserHeadless({ NUMASEC_BROWSER_HEADLESS: "0" })).toBe(false)
     expect(isBrowserHeadless({ NUMASEC_BROWSER_HEADLESS: "off" })).toBe(false)
     expect(isBrowserHeadless({ NUMASEC_BROWSER_HEADLESS: "true" })).toBe(true)
+  })
+
+  test("Linux root 有头模式会自动附加 Chromium 兼容参数", () => {
+    expect(
+      browserLaunchOptions({
+        env: { NUMASEC_BROWSER_HEADLESS: "false" },
+        platform: "linux",
+        uid: 0,
+      }),
+    ).toEqual({
+      headless: false,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"],
+    })
   })
 
   test("按存储语义提取 Authorization、CSRF 与 API Key", () => {
