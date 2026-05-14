@@ -130,7 +130,6 @@ interface Session {
 }
 
 const sessions = new Map<string, Session>()
-let counter = 0
 
 const EVIDENCE_MAX_OUTPUT = 128_000
 
@@ -400,9 +399,9 @@ function defaultBrowserIdentityKey(currentUrl?: string) {
   return "browser:session"
 }
 
-async function exportBrowserIdentityState(params: Params, abort: AbortSignal) {
+async function exportBrowserIdentityState(params: Params, sessionID: string) {
   const timeout = params.timeout ?? 30_000
-  const session = await ensure(abort)
+  const session = await ensure(sessionID)
   await hydrate(session.context, session.page, params)
   const page = session.page
   const context = session.context
@@ -454,8 +453,8 @@ async function exportBrowserIdentityState(params: Params, abort: AbortSignal) {
   }
 }
 
-async function ensure(abort: AbortSignal): Promise<Session> {
-  const id = `s${counter}`
+async function ensure(sessionID: string): Promise<Session> {
+  const id = sessionID
   const existing = sessions.get(id)
   if (existing) return existing
 
@@ -564,16 +563,6 @@ async function ensure(abort: AbortSignal): Promise<Session> {
   })
 
   sessions.set(id, entry)
-
-  abort.addEventListener(
-    "abort",
-    () => {
-      sessions.delete(id)
-      browser.close().catch(() => undefined)
-      counter += 1
-    },
-    { once: true },
-  )
 
   return entry
 }
@@ -1050,9 +1039,9 @@ export function persistBrowserObservation(params: Params, result: Tool.ExecuteRe
   })
 }
 
-async function run(params: Params, abort: AbortSignal): Promise<Tool.ExecuteResult> {
+async function run(params: Params, sessionID: string): Promise<Tool.ExecuteResult> {
   const timeout = params.timeout ?? 30_000
-  const session = await ensure(abort)
+  const session = await ensure(sessionID)
   const identity = await hydrate(session.context, session.page, params)
   const page = session.page
   const context = session.context
@@ -1334,7 +1323,7 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
           })
 
           if (params.action === "export_identity") {
-            const exported = yield* Effect.promise(() => exportBrowserIdentityState(params, ctx.abort))
+            const exported = yield* Effect.promise(() => exportBrowserIdentityState(params, ctx.sessionID))
             const stored = yield* persistExportedBrowserIdentity(exported, ctx)
 
             const result = {
@@ -1367,7 +1356,7 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
             return result
           }
 
-          const result = yield* Effect.promise(() => run(params, ctx.abort))
+          const result = yield* Effect.promise(() => run(params, ctx.sessionID))
 
           if (params.action === "pause") {
             yield* question.ask({
@@ -1389,7 +1378,7 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
               ],
             })
 
-            const session = yield* Effect.promise(() => ensure(ctx.abort))
+            const session = yield* Effect.promise(() => ensure(ctx.sessionID))
             const currentUrl = session.page.url()
             const cookies = yield* Effect.promise(() => session.context.cookies())
             const resumed = {
