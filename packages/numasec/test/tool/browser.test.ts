@@ -16,6 +16,7 @@ import { Truncate } from "../../src/tool"
 import {
   BrowserTool,
   browserLaunchOptions,
+  bringBrowserPageToFront,
   cookieHeaderFromContextCookies,
   inferIdentityHeadersFromStorage,
   isBrowserHeadless,
@@ -73,6 +74,36 @@ describe("tool/browser", () => {
       headless: false,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"],
     })
+  })
+
+  test("有头模式下会尝试前置浏览器页面", async () => {
+    let calls = 0
+    const focused = await bringBrowserPageToFront(
+      {
+        bringToFront: async () => {
+          calls += 1
+        },
+      },
+      { NUMASEC_BROWSER_HEADLESS: "false" },
+    )
+
+    expect(focused).toBe(true)
+    expect(calls).toBe(1)
+  })
+
+  test("无头模式下不会尝试前置浏览器页面", async () => {
+    let calls = 0
+    const focused = await bringBrowserPageToFront(
+      {
+        bringToFront: async () => {
+          calls += 1
+        },
+      },
+      { NUMASEC_BROWSER_HEADLESS: "true" },
+    )
+
+    expect(focused).toBe(false)
+    expect(calls).toBe(0)
   })
 
   test("按存储语义提取 Authorization、CSRF 与 API Key", () => {

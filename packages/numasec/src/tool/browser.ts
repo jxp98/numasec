@@ -59,6 +59,16 @@ export function browserLaunchOptions(input: {
   return { ...base, headless }
 }
 
+export async function bringBrowserPageToFront(
+  page: { bringToFront?: () => Promise<unknown> } | null | undefined,
+  env: Record<string, string | undefined> = process.env,
+) {
+  if (isBrowserHeadless(env)) return false
+  if (!page || typeof page.bringToFront !== "function") return false
+  await page.bringToFront().catch(() => undefined)
+  return true
+}
+
 const parameters = z.object({
   action: z
     .enum([
@@ -523,6 +533,7 @@ async function ensure(sessionID: string): Promise<Session> {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
   })
   const page = await context.newPage()
+  await bringBrowserPageToFront(page)
   const entry: Session = { browser, context, page, console: [], network: [] }
 
   const MAX_BUFFER = 500
@@ -1046,6 +1057,8 @@ async function run(params: Params, sessionID: string): Promise<Tool.ExecuteResul
   const page = session.page
   const context = session.context
 
+  await bringBrowserPageToFront(page)
+
   if (params.url && params.action !== "navigate" && params.action !== "passive_appsec") {
     await page.goto(params.url, { timeout, waitUntil: "domcontentloaded" })
   }
@@ -1359,6 +1372,9 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
           const result = yield* Effect.promise(() => run(params, ctx.sessionID))
 
           if (params.action === "pause") {
+            const session = yield* Effect.promise(() => ensure(ctx.sessionID))
+            yield* Effect.promise(() => bringBrowserPageToFront(session.page))
+
             yield* question.ask({
               sessionID: ctx.sessionID,
               tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
@@ -1378,7 +1394,6 @@ export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Q
               ],
             })
 
-            const session = yield* Effect.promise(() => ensure(ctx.sessionID))
             const currentUrl = session.page.url()
             const cookies = yield* Effect.promise(() => session.context.cookies())
             const resumed = {
