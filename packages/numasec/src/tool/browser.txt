@@ -1,4 +1,4 @@
-Control a headless Chromium browser via Playwright for security testing of JavaScript-heavy applications, SPAs, and authenticated workflows.
+Control a Chromium browser via Playwright for security testing of JavaScript-heavy applications, SPAs, and authenticated workflows.
 
 Actions:
 - navigate: Load a URL and capture page content, cookies, and network state
@@ -6,6 +6,8 @@ Actions:
 - fill: Fill a form field by CSS selector with a value
 - screenshot: Capture a full-page PNG screenshot
 - evaluate: Execute arbitrary JavaScript in the page context
+- pause: Pause and wait for the operator to finish a manual browser step（例如登录、SSO、MFA、验证码）后再继续
+- export_identity: Export the current browser login state into the active identity for follow-up http_request and API testing
 - get_cookies: Retrieve all cookies for the current browser context
 - dom_snapshot: Capture full DOM + structured summary (forms, links, scripts). Caches for dom_diff.
 - storage_snapshot: Read localStorage, sessionStorage, and cookies together
@@ -17,6 +19,7 @@ Actions:
 Parameters:
 - action: The browser action to perform
 - url: URL to navigate to (required for navigate and passive_appsec, optional for others to pre-navigate)
+- key: Identity key to store when using export_identity
 - selector: CSS selector for click/fill actions
 - value: Text value for fill, or JavaScript code for evaluate
 - timeout: Action timeout in milliseconds (default 30000)
@@ -32,7 +35,9 @@ Use this tool for:
 - Verifying DOM-based XSS by injecting payloads and observing execution
 - Filling and submitting forms programmatically
 - Testing authentication flows with cookie/token seeding
+- Performing half-manual workflows where the operator logs in and the browser session is resumed afterward
+- Exporting browser-acquired login state for follow-up API testing with http_request
 - Capturing screenshots as evidence of security findings
 - Evaluating JavaScript to inspect page state or trigger behaviors
 
-Requires Playwright and Chromium binaries. For static pages, prefer http_request instead.
+Requires Playwright and Chromium binaries. For visible browser windows, set `NUMASEC_BROWSER_HEADLESS=false`. For static pages, prefer http_request instead.

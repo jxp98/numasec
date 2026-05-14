@@ -8,8 +8,18 @@ import { Cyber } from "@/core/cyber"
 import { Evidence } from "@/core/evidence"
 import { Observation } from "@/core/observation"
 import { Operation } from "@/core/operation"
-import { activeIdentity } from "@/core/vault"
+import { activeIdentity, loadVault, resolveIdentityValue, saveVault } from "@/core/vault"
 import { Instance } from "@/project/instance"
+
+import { Question } from "@/question"
+
+const browserHeadfulDisableValues = new Set(["0", "false", "no", "off"])
+
+export function isBrowserHeadless(env: Record<string, string | undefined> = process.env) {
+  const value = env.NUMASEC_BROWSER_HEADLESS?.trim().toLowerCase()
+  if (!value) return true
+  return !browserHeadfulDisableValues.has(value)
+}
 
 const parameters = z.object({
   action: z
@@ -19,6 +29,8 @@ const parameters = z.object({
       "fill",
       "screenshot",
       "evaluate",
+      "pause",
+      "export_identity",
       "get_cookies",
       "dom_snapshot",
       "storage_snapshot",
@@ -32,6 +44,7 @@ const parameters = z.object({
     .string()
     .optional()
     .describe("URL to navigate to. When provided for non-navigate actions, the page is loaded first."),
+  key: z.string().optional().describe("Identity key used by export_identity action"),
   selector: z.string().optional().describe("CSS selector for click/fill actions"),
   value: z.string().optional().describe("Value for fill action or JS code for evaluate"),
   timeout: z.number().optional().describe("Action timeout in ms (default 30000)"),
@@ -135,6 +148,274 @@ async function seedStorage(page: any, params: Params) {
     .catch(() => undefined)
 }
 
+type BrowserStorageSnapshot = {
+  local: Record<string, string>
+  session: Record<string, string>
+}
+
+type BrowserCookieLike = {
+  name: string
+  value: string
+  domain?: string
+}
+
+async function readBrowserStorage(page: any): Promise<BrowserStorageSnapshot> {
+  return await page
+    .evaluate(() => {
+      const local: Record<string, string> = {}
+      const session: Record<string, string> = {}
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i)
+        if (key) local[key] = localStorage.getItem(key) ?? ""
+      }
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i)
+        if (key) session[key] = sessionStorage.getItem(key) ?? ""
+      }
+      return { local, session }
+    })
+    .catch(() => ({ local: {}, session: {} }))
+}
+
+function normalizeIdentityField(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "")
+}
+
+function looksLikeJwt(value: string) {
+  return /^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/.test(value.trim())
+}
+
+function looksLikeOpaqueToken(value: string) {
+  return /^[A-Za-z0-9._~+\-/=]{20,}$/.test(value.trim())
+}
+
+function normalizeAuthorizationValue(value: string) {
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  if (trimmed.startsWith("Authorization:")) {
+    return trimmed.slice("Authorization:".length).trim()
+  }
+  if (/^[A-Za-z][A-Za-z-]*\s+/.test(trimmed)) return trimmed
+  return `Bearer ${trimmed}`
+}
+
+function visitIdentityCandidates(value: unknown, path: string[], visit: (candidatePath: string[], candidateValue: string) => void, depth = 0) {
+  if (typeof value === "string") {
+    visit(path, value)
+    const trimmed = value.trim()
+    if (!trimmed || depth >= 3 || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) return
+    try {
+      visitIdentityCandidates(JSON.parse(trimmed), path, visit, depth + 1)
+    } catch {}
+    return
+  }
+
+  if (!value || typeof value !== "object" || depth >= 3) return
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      visitIdentityCandidates(item, path, visit, depth + 1)
+    }
+    return
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    visitIdentityCandidates(child, [...path, key], visit, depth + 1)
+  }
+}
+
+export function inferIdentityHeadersFromStorage(local: Record<string, string>, session: Record<string, string>) {
+  const headers: Record<string, string> = {}
+
+  const assign = (name: string, value: string | undefined, force = false) => {
+    if (!value) return
+    if (!force && headers[name]) return
+    headers[name] = value
+  }
+
+  const consider = (path: string[], rawValue: string) => {
+    const trimmed = rawValue.trim()
+    if (!trimmed) return
+    const normalizedPath = path.map(normalizeIdentityField).filter(Boolean)
+    const joined = normalizedPath.join(".")
+    const last = normalizedPath.at(-1) ?? ""
+
+    if (joined.includes("refreshtoken")) return
+
+    if (last.includes("authorization") || joined.includes("authheader")) {
+      assign("Authorization", normalizeAuthorizationValue(trimmed), true)
+      return
+    }
+
+    if (joined.includes("apikey") || joined.includes("xapikey")) {
+      assign("X-API-Key", trimmed)
+      return
+    }
+
+    if (joined.includes("xsrf")) {
+      assign("X-XSRF-TOKEN", trimmed, true)
+      return
+    }
+
+    if (joined.includes("csrf")) {
+      assign("X-CSRF-Token", trimmed, true)
+      return
+    }
+
+    const authLike =
+      joined.includes("accesstoken") ||
+      joined.includes("authtoken") ||
+      joined.includes("idtoken") ||
+      joined.endsWith("jwt") ||
+      ((last === "token" || joined.endsWith("session.token") || joined.endsWith("auth.token")) &&
+        (looksLikeJwt(trimmed) || looksLikeOpaqueToken(trimmed)))
+
+    if (authLike) {
+      assign("Authorization", normalizeAuthorizationValue(trimmed))
+    }
+  }
+
+  for (const [key, value] of Object.entries(session)) {
+    visitIdentityCandidates(value, [key], consider)
+  }
+  for (const [key, value] of Object.entries(local)) {
+    visitIdentityCandidates(value, [key], consider)
+  }
+
+  return headers
+}
+
+function decodeCookieValue(value: string) {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+export function inferIdentityHeadersFromCookies(cookies: BrowserCookieLike[]) {
+  const headers: Record<string, string> = {}
+
+  for (const cookie of cookies) {
+    const normalized = normalizeIdentityField(cookie.name)
+    if (!headers["X-XSRF-TOKEN"] && normalized === "xsrftoken") {
+      headers["X-XSRF-TOKEN"] = decodeCookieValue(cookie.value)
+      continue
+    }
+    if (!headers["X-CSRF-Token"] && (normalized === "csrftoken" || normalized === "csrf")) {
+      headers["X-CSRF-Token"] = decodeCookieValue(cookie.value)
+    }
+  }
+
+  return headers
+}
+
+function hostMatchesCookieDomain(host: string, domain?: string) {
+  if (!domain) return true
+  const normalized = domain.replace(/^\./, "").toLowerCase()
+  const target = host.toLowerCase()
+  return target === normalized || target.endsWith(`.${normalized}`)
+}
+
+export function cookieHeaderFromContextCookies(cookies: BrowserCookieLike[], currentUrl?: string) {
+  let selected = cookies.filter((cookie) => Boolean(cookie.name))
+
+  if (currentUrl?.startsWith("http://") || currentUrl?.startsWith("https://")) {
+    const host = new URL(currentUrl).hostname
+    const scoped = selected.filter((cookie) => hostMatchesCookieDomain(host, cookie.domain))
+    if (scoped.length > 0) selected = scoped
+  }
+
+  const unique = new Map<string, string>()
+  for (const cookie of [...selected].sort((left, right) => left.name.localeCompare(right.name))) {
+    unique.set(cookie.name, cookie.value)
+  }
+
+  const header = Array.from(unique.entries())
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ")
+
+  return header || undefined
+}
+
+async function readMetaSecurityHeaders(page: any) {
+  return await page
+    .evaluate(() => {
+      const headers: Record<string, string> = {}
+      const metas = Array.from(document.querySelectorAll("meta[name][content]")) as HTMLMetaElement[]
+      for (const meta of metas) {
+        const name = meta.name.toLowerCase()
+        const value = meta.content.trim()
+        if (!value) continue
+        if (name.includes("xsrf")) headers["X-XSRF-TOKEN"] = value
+        if (name.includes("csrf")) headers["X-CSRF-Token"] = value
+      }
+      return headers
+    })
+    .catch(() => ({} as Record<string, string>))
+}
+
+function defaultBrowserIdentityKey(currentUrl?: string) {
+  if (currentUrl?.startsWith("http://") || currentUrl?.startsWith("https://")) {
+    const target = new URL(currentUrl)
+    return `browser:${target.host}`
+  }
+  return "browser:session"
+}
+
+async function exportBrowserIdentityState(params: Params, abort: AbortSignal) {
+  const timeout = params.timeout ?? 30_000
+  const session = await ensure(abort)
+  await hydrate(session.context, session.page, params)
+  const page = session.page
+  const context = session.context
+
+  if (params.url) {
+    await page.goto(params.url, { timeout, waitUntil: "domcontentloaded" }).catch(() => undefined)
+  }
+
+  const currentUrl = page.url() || params.url
+  const storage = await readBrowserStorage(page)
+  const contextCookies = await context.cookies()
+  const cookies = cookieHeaderFromContextCookies(contextCookies, currentUrl)
+  const headers = {
+    ...inferIdentityHeadersFromStorage(storage.local, storage.session),
+    ...inferIdentityHeadersFromCookies(contextCookies),
+    ...(await readMetaSecurityHeaders(page)),
+  }
+
+  if (!cookies && Object.keys(headers).length === 0) {
+    throw new Error(
+      "No reusable browser identity state found. Complete login first, then inspect get_cookies or storage_snapshot if needed.",
+    )
+  }
+
+  const key = params.key?.trim() || defaultBrowserIdentityKey(currentUrl)
+  const value = JSON.stringify({
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
+    cookies,
+    source: "browser.export_identity",
+    page_url: currentUrl,
+    origin:
+      currentUrl && (currentUrl.startsWith("http://") || currentUrl.startsWith("https://"))
+        ? new URL(currentUrl).origin
+        : undefined,
+    exported_at: new Date().toISOString(),
+  })
+  const resolved = resolveIdentityValue(key, value)
+
+  return {
+    key,
+    value,
+    currentUrl,
+    mode: resolved.mode,
+    headerKeys: Object.keys(resolved.headers ?? {}),
+    hasCookies: Boolean(resolved.cookies),
+    cookieCount: cookies ? cookies.split(/;\s*/).filter(Boolean).length : 0,
+    localKeys: Object.keys(storage.local).sort(),
+    sessionKeys: Object.keys(storage.session).sort(),
+  }
+}
+
 async function ensure(abort: AbortSignal): Promise<Session> {
   const id = `s${counter}`
   const existing = sessions.get(id)
@@ -147,9 +428,6 @@ async function ensure(abort: AbortSignal): Promise<Session> {
     // import entirely failed — not installed
   }
 
-  // In compiled binaries, import("playwright") may succeed but return a
-  // broken module (chromium undefined) due to Bun embedding CI paths into
-  // playwright-core's require.resolve calls. Try local filesystem fallback.
   if (!pw?.chromium?.launch) {
     try {
       const { createRequire } = await import("module")
@@ -161,21 +439,26 @@ async function ensure(abort: AbortSignal): Promise<Session> {
   }
 
   if (!pw?.chromium?.launch) {
-    throw new Error(
-      "Playwright is not installed. Run: bun add playwright && npx playwright install chromium",
-    )
+    throw new Error("Playwright is not installed. Run: bun add playwright && npx playwright install chromium")
   }
 
   const launchOptions = (executablePath?: string) => {
     const base = executablePath ? { executablePath } : {}
+    const headless = isBrowserHeadless()
     if (process.platform === "win32" && typeof globalThis.Bun !== "undefined") {
+      if (!headless) {
+        return {
+          ...base,
+          headless: false,
+        } as Parameters<typeof pw.chromium.launch>[0]
+      }
       return {
         ...base,
         headless: false,
         args: ["--headless=new"],
       } as Parameters<typeof pw.chromium.launch>[0]
     }
-    return { ...base, headless: true } as Parameters<typeof pw.chromium.launch>[0]
+    return { ...base, headless } as Parameters<typeof pw.chromium.launch>[0]
   }
 
   let firstError: string | undefined
@@ -185,7 +468,6 @@ async function ensure(abort: AbortSignal): Promise<Session> {
   } catch (err) {
     firstError = err instanceof Error ? err.message : String(err)
 
-    // Fallback: NUMASEC_CHROMIUM_PATH env var
     const envPath = process.env.NUMASEC_CHROMIUM_PATH
     if (envPath) {
       try {
@@ -195,7 +477,6 @@ async function ensure(abort: AbortSignal): Promise<Session> {
       }
     }
 
-    // Fallback: search system PATH for chromium / chrome
     if (!browser!) {
       const systemNames = ["chromium", "chromium-browser", "google-chrome", "chrome"]
       for (const name of systemNames) {
@@ -217,6 +498,7 @@ async function ensure(abort: AbortSignal): Promise<Session> {
       )
     }
   }
+
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
     userAgent:
@@ -291,6 +573,112 @@ async function hydrate(context: any, page: any, params: Params) {
     if (seed.length > 0) await context.addCookies(seed)
   }
   return identity
+}
+
+export function persistExportedBrowserIdentity(
+  input: {
+    key: string
+    value: string
+    currentUrl?: string
+    cookieCount: number
+    localKeys: string[]
+    sessionKeys: string[]
+  },
+  ctx: Tool.Context,
+) {
+  return Effect.gen(function* () {
+    const vault = yield* Effect.promise(() => loadVault())
+    const previous = vault.active_identity
+    const now = new Date().toISOString()
+
+    vault.secrets[input.key] = { value: input.value, updated_at: now }
+    vault.active_identity = input.key
+    vault.active_identity_set_at = now
+    yield* Effect.promise(() => saveVault(vault))
+
+    const resolved = resolveIdentityValue(input.key, input.value)
+    const descriptor = {
+      mode: resolved.mode,
+      header_keys: Object.keys(resolved.headers ?? {}),
+      has_cookies: Boolean(resolved.cookies),
+    }
+
+    const eventID = yield* Cyber.appendLedger({
+      kind: "fact.observed",
+      source: "browser",
+      summary: `exported browser identity ${input.key}`,
+      session_id: ctx.sessionID,
+      message_id: ctx.messageID,
+      data: {
+        action: "export_identity",
+        key: input.key,
+        previous,
+        url: input.currentUrl,
+        mode: descriptor.mode,
+        header_keys: descriptor.header_keys,
+        has_cookies: descriptor.has_cookies,
+        cookie_count: input.cookieCount,
+        local_keys: input.localKeys,
+        session_keys: input.sessionKeys,
+      },
+    }).pipe(Effect.catch(() => Effect.succeed("")))
+
+    if (previous && previous !== input.key) {
+      yield* Cyber.upsertFact({
+        entity_kind: "identity",
+        entity_key: previous,
+        fact_name: "active",
+        value_json: false,
+        writer_kind: "tool",
+        status: "observed",
+        confidence: 1000,
+        source_event_id: eventID || undefined,
+      }).pipe(Effect.catch(() => Effect.succeed("")))
+    }
+
+    yield* Cyber.upsertFact({
+      entity_kind: "identity",
+      entity_key: input.key,
+      fact_name: "descriptor",
+      value_json: descriptor,
+      writer_kind: "tool",
+      status: "observed",
+      confidence: 1000,
+      source_event_id: eventID || undefined,
+    }).pipe(Effect.catch(() => Effect.succeed("")))
+
+    yield* Cyber.upsertFact({
+      entity_kind: "identity",
+      entity_key: input.key,
+      fact_name: "active",
+      value_json: true,
+      writer_kind: "tool",
+      status: "observed",
+      confidence: 1000,
+      source_event_id: eventID || undefined,
+    }).pipe(Effect.catch(() => Effect.succeed("")))
+
+    const slug = yield* Effect.promise(() => Operation.activeSlug(Instance.directory).catch(() => undefined)).pipe(
+      Effect.catch(() => Effect.succeed(undefined)),
+    )
+
+    if (slug) {
+      yield* Cyber.upsertRelation({
+        operation_slug: slug,
+        src_kind: "operation",
+        src_key: slug,
+        relation: "uses_identity",
+        dst_kind: "identity",
+        dst_key: input.key,
+        writer_kind: "tool",
+        status: "observed",
+        confidence: 1000,
+        source_event_id: eventID || undefined,
+      }).pipe(Effect.catch(() => Effect.succeed("")))
+    }
+
+    return { previous, descriptor }
+  })
 }
 
 async function navigateForPassiveAnalysis(page: any, url: string, timeout: number) {
@@ -738,9 +1126,7 @@ async function run(params: Params, abort: AbortSignal): Promise<Tool.ExecuteResu
       title: "Screenshot captured",
       metadata: { size: buf.length, url: page.url(), activeIdentity: identity?.key },
       output: "Screenshot captured successfully.",
-      attachments: [
-        { type: "file" as const, mime: "image/png", url: `data:image/png;base64,${base64}` },
-      ],
+      attachments: [{ type: "file" as const, mime: "image/png", url: `data:image/png;base64,${base64}` }],
     }
   }
 
@@ -752,6 +1138,25 @@ async function run(params: Params, abort: AbortSignal): Promise<Tool.ExecuteResu
       title: "JS Evaluate",
       metadata: { currentUrl: page.url(), activeIdentity: identity?.key },
       output: formatted,
+    }
+  }
+
+  if (params.action === "pause") {
+    const cookies = await context.cookies()
+    return {
+      title: "Browser paused for manual step",
+      metadata: {
+        currentUrl: page.url(),
+        cookieCount: cookies.length,
+        activeIdentity: identity?.key,
+      },
+      output: [
+        `Current URL: ${page.url() || params.url || "(blank page)"}`,
+        `Cookies: ${cookies.length}`,
+        "Complete the manual browser step now (for example login, SSO, MFA, or a challenge).",
+        "Choose Continue in numasec when you are ready to resume automated testing.",
+        "After resuming, use storage_snapshot or get_cookies to inspect the resulting login state.",
+      ].join("\n"),
     }
   }
 
@@ -811,21 +1216,7 @@ async function run(params: Params, abort: AbortSignal): Promise<Tool.ExecuteResu
   }
 
   if (params.action === "storage_snapshot") {
-    const storage = await page
-      .evaluate(() => {
-        const local: Record<string, string> = {}
-        const session: Record<string, string> = {}
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i)
-          if (k) local[k] = localStorage.getItem(k) ?? ""
-        }
-        for (let i = 0; i < sessionStorage.length; i++) {
-          const k = sessionStorage.key(i)
-          if (k) session[k] = sessionStorage.getItem(k) ?? ""
-        }
-        return { local, session }
-      })
-      .catch(() => ({ local: {}, session: {} }))
+    const storage = await readBrowserStorage(page)
     const cookies = await context.cookies()
     return {
       title: `Storage ${page.url()}`,
@@ -902,21 +1293,108 @@ async function run(params: Params, abort: AbortSignal): Promise<Tool.ExecuteResu
   throw new Error(`Unknown action: ${params.action}`)
 }
 
-export const BrowserTool = Tool.define(
+export const BrowserTool = Tool.define<typeof parameters, Record<string, any>, Question.Service>(
   "browser",
   Effect.gen(function* () {
+    const question = yield* Question.Service
+
     return {
       description: DESCRIPTION,
       parameters,
       execute: (params: Params, ctx: Tool.Context) =>
         Effect.gen(function* () {
+          if (params.action === "pause" && isBrowserHeadless()) {
+            throw new Error("browser pause requires a visible browser. Set NUMASEC_BROWSER_HEADLESS=false and retry.")
+          }
+
           yield* ctx.ask({
             permission: "browser",
             patterns: [params.url ?? params.selector ?? params.action],
             always: [],
             metadata: { action: params.action, url: params.url },
           })
+
+          if (params.action === "export_identity") {
+            const exported = yield* Effect.promise(() => exportBrowserIdentityState(params, ctx.abort))
+            const stored = yield* persistExportedBrowserIdentity(exported, ctx)
+
+            const result = {
+              title: `identity · ${exported.key}`,
+              metadata: {
+                action: "export_identity",
+                key: exported.key,
+                previousIdentity: stored.previous,
+                mode: stored.descriptor.mode,
+                headerKeys: stored.descriptor.header_keys,
+                cookieCount: exported.cookieCount,
+                localStorageKeys: exported.localKeys.length,
+                sessionStorageKeys: exported.sessionKeys.length,
+                currentUrl: exported.currentUrl,
+                activeIdentity: exported.key,
+              },
+              output: [
+                `Active identity: ${exported.key}`,
+                `Mode: ${stored.descriptor.mode}`,
+                `Current URL: ${exported.currentUrl || "(blank page)"}`,
+                `Headers: ${stored.descriptor.header_keys.length > 0 ? stored.descriptor.header_keys.join(", ") : "none"}`,
+                `Cookies: ${exported.cookieCount}`,
+                `localStorage keys inspected: ${exported.localKeys.length}`,
+                `sessionStorage keys inspected: ${exported.sessionKeys.length}`,
+                "Subsequent http_request calls will automatically reuse this active identity unless you override headers or cookies explicitly.",
+              ].join("\n"),
+            } satisfies Tool.ExecuteResult
+
+            yield* persistBrowserObservation(params, result, ctx).pipe(Effect.catch(() => Effect.void))
+            return result
+          }
+
           const result = yield* Effect.promise(() => run(params, ctx.abort))
+
+          if (params.action === "pause") {
+            yield* question.ask({
+              sessionID: ctx.sessionID,
+              tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+              questions: [
+                {
+                  header: "Browser",
+                  question:
+                    "Complete the manual browser step in the visible browser (for example login, SSO, MFA, or a challenge), then choose Continue.",
+                  options: [
+                    {
+                      label: "Continue",
+                      description: "Resume automated testing with the current browser session",
+                    },
+                  ],
+                  custom: false,
+                },
+              ],
+            })
+
+            const session = yield* Effect.promise(() => ensure(ctx.abort))
+            const currentUrl = session.page.url()
+            const cookies = yield* Effect.promise(() => session.context.cookies())
+            const resumed = {
+              ...result,
+              title: "Browser resumed",
+              metadata: {
+                ...result.metadata,
+                currentUrl,
+                cookieCount: cookies.length,
+                resumed: true,
+              },
+              output: [
+                result.output,
+                "",
+                "Resumed browser session.",
+                `Current URL: ${currentUrl || "(blank page)"}`,
+                `Cookies: ${cookies.length}`,
+                "You can now continue with storage_snapshot, get_cookies, dom_snapshot, or follow-up browser actions.",
+              ].join("\n"),
+            }
+            yield* persistBrowserObservation(params, resumed, ctx).pipe(Effect.catch(() => Effect.void))
+            return resumed
+          }
+
           yield* persistBrowserObservation(params, result, ctx).pipe(Effect.catch(() => Effect.void))
           return result
         }).pipe(Effect.orDie),

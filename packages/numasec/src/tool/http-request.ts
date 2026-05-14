@@ -126,9 +126,9 @@ export const HttpRequestTool = Tool.define(
           const curl = replay({
             url: params.url,
             method: params.method,
-            headers: params.headers,
+            headers: Object.fromEntries(Object.entries(merged).filter(([name]) => name !== "Cookie")),
             body: params.body,
-            cookies: params.cookies,
+            cookies: merged["Cookie"],
           })
 
           const output = [
